@@ -6,6 +6,7 @@ on:
 jobs:
   build:
     runs-on: ubuntu-22.04
+    timeout-minutes: 360
 
     steps:
       - name: Checkout source
@@ -13,8 +14,33 @@ jobs:
         with:
           fetch-depth: 1
 
-      - name: Install build dependencies
+      - name: Diagnose build environment
+        shell: bash
         run: |
+          set -euo pipefail
+
+          echo "=== System information ==="
+          uname -a
+
+          echo "=== CPU ==="
+          echo "CPU cores: $(nproc)"
+          lscpu || true
+
+          echo "=== Memory ==="
+          free -h
+
+          echo "=== Disk ==="
+          df -h
+
+          echo "=== Repository ==="
+          git status
+          git log -1 --oneline
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+
           sudo apt-get update
 
           sudo apt-get install -y \
@@ -44,16 +70,54 @@ jobs:
             xsltproc \
             libxml-parser-perl \
             libelf-dev \
-            device-tree-compiler
+            device-tree-compiler \
+            libreadline-dev \
+            libtool \
+            autoconf \
+            automake \
+            pkg-config
 
       - name: Update feeds
+        shell: bash
         run: |
+          set -euo pipefail
+
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
-      - name: Fix IPv6 iptables module for Linux 6.12
+      - name: Detect Linux kernel version
+        shell: bash
         run: |
-          python3 - <<'PY'
+          set -euo pipefail
+
+          echo "=== Possible kernel version definitions ==="
+
+          grep -RInE \
+            'KERNEL_PATCHVER|LINUX_VERSION' \
+            target/linux/mediatek \
+            include/kernel-version.mk \
+            2>/dev/null || true
+
+      - name: Fix IPv6 iptables for Linux 6.12
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          NETFILTER_FILE="include/netfilter.mk"
+
+          if [ ! -f "$NETFILTER_FILE" ]; then
+            echo "ERROR: $NETFILTER_FILE not found"
+            exit 1
+          fi
+
+          if grep -RqsE \
+            'KERNEL_PATCHVER[[:space:]]*:?=[[:space:]]*6\.12' \
+            target/linux/mediatek; then
+
+            echo "Linux 6.12 detected"
+            echo "Applying IPv6 iptables compatibility fix"
+
+            python3 - <<'PY'
           from pathlib import Path
 
           path = Path("include/netfilter.mk")
@@ -69,15 +133,23 @@ jobs:
           elif new in text:
               print("Linux 6.12 IPv6 iptables fix already exists")
           else:
-              print("Cannot find expected IPv6 iptables line")
+              print("ERROR: Expected IPv6 iptables configuration was not found")
               raise SystemExit(1)
           PY
 
-          echo "Current IPv6 iptables configuration:"
-          grep -n "IP6_NF_IPTABLES" include/netfilter.mk
+          else
+            echo "Linux 6.12 was not detected"
+            echo "Skipping IPv6 iptables compatibility fix"
+          fi
 
-      - name: Create configuration
+          echo "=== Current IPv6 iptables configuration ==="
+          grep -n "IP6_NF_IPTABLES" "$NETFILTER_FILE" || true
+
+      - name: Create OpenWrt configuration
+        shell: bash
         run: |
+          set -euo pipefail
+
           cat > .config <<'EOF'
           CONFIG_TARGET_mediatek=y
           CONFIG_TARGET_mediatek_filogic=y
@@ -89,72 +161,285 @@ jobs:
 
           make defconfig
 
-      - name: Clean incomplete host tools
+          echo "=== Selected target configuration ==="
+          grep -E '^CONFIG_TARGET_' .config || true
+
+          echo "=== Selected package configuration ==="
+          grep -E \
+            '^CONFIG_PACKAGE_(kmod-ip6tables|kmod-nf-ipt6|ip6tables-nft)' \
+            .config || true
+
+          echo "=== Checking required OpenWrt configuration ==="
+
+          grep -qxF 'CONFIG_TARGET_mediatek=y' .config
+          grep -qxF 'CONFIG_TARGET_mediatek_filogic=y' .config
+          grep -qxF 'CONFIG_PACKAGE_kmod-ip6tables=m' .config
+          grep -qxF 'CONFIG_PACKAGE_kmod-nf-ipt6=m' .config
+          grep -qxF 'CONFIG_PACKAGE_ip6tables-nft=m' .config
+
+          echo "Required OpenWrt configuration is valid"
+
+      - name: Clean incomplete host files
+        shell: bash
         run: |
+          set -euo pipefail
+
           rm -rf staging_dir/host
           rm -rf build_dir/host
           rm -rf build_dir/hostpkg
           rm -rf tmp
 
       - name: Build OpenWrt host tools
+        shell: bash
         run: |
-          make tools/install -j2 V=s
+          set -euo pipefail
+
+          make tools/install -j1 V=sc 2>&1 \
+            | tee tools-build.log
 
       - name: Build OpenWrt toolchain
+        shell: bash
         run: |
-          make toolchain/install -j2 V=s
+          set -euo pipefail
+
+          make toolchain/install -j1 V=sc 2>&1 \
+            | tee toolchain-build.log
 
       - name: Check required host tools
+        shell: bash
         run: |
+          set -euo pipefail
+
           test -x staging_dir/host/bin/openssl
           test -x staging_dir/host/bin/libdeflate-gzip
 
-          echo "openssl:"
-          ls -l staging_dir/host/bin/openssl
+          echo "=== openssl ==="
+          ls -lh staging_dir/host/bin/openssl
 
-          echo "libdeflate-gzip:"
-          ls -l staging_dir/host/bin/libdeflate-gzip
+          echo "=== libdeflate-gzip ==="
+          ls -lh staging_dir/host/bin/libdeflate-gzip
+
+      - name: Prepare Linux kernel tree
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          make target/linux/prepare -j1 V=sc 2>&1 \
+            | tee linux-prepare.log
+
+      - name: Build Linux kernel target
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          make target/linux/compile -j1 V=sc 2>&1 \
+            | tee linux-compile.log
+
+      - name: Find kernel build directory
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          KERNEL_BASE_DIR="$(
+            find build_dir/target-* \
+              -maxdepth 1 \
+              -type d \
+              -name 'linux-mediatek_filogic' \
+              -print -quit 2>/dev/null || true
+          )"
+
+          if [ -z "$KERNEL_BASE_DIR" ]; then
+            echo "ERROR: Target kernel base directory not found"
+
+            echo "Existing mediatek kernel directories:"
+            find build_dir \
+              -maxdepth 5 \
+              -type d \
+              -name 'linux-mediatek_filogic' \
+              -print || true
+
+            exit 1
+          fi
+
+          KERNEL_DIR="$(
+            find "$KERNEL_BASE_DIR" \
+              -maxdepth 1 \
+              -mindepth 1 \
+              -type d \
+              -name 'linux-*' \
+              -print -quit
+          )"
+
+          if [ -z "$KERNEL_DIR" ]; then
+            echo "ERROR: Linux kernel source directory not found"
+
+            find "$KERNEL_BASE_DIR" \
+              -maxdepth 2 \
+              -print || true
+
+            exit 1
+          fi
+
+          echo "KERNEL_BASE_DIR=$KERNEL_BASE_DIR" >> "$GITHUB_ENV"
+          echo "KERNEL_DIR=$KERNEL_DIR" >> "$GITHUB_ENV"
+
+          echo "Kernel base directory:"
+          echo "$KERNEL_BASE_DIR"
+
+          echo "Kernel source directory:"
+          echo "$KERNEL_DIR"
+
+      - name: Check generated kernel configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ ! -d "$KERNEL_DIR" ]; then
+            echo "ERROR: Kernel directory does not exist:"
+            echo "$KERNEL_DIR"
+            exit 1
+          fi
+
+          if [ ! -f "$KERNEL_DIR/.config" ]; then
+            echo "ERROR: Kernel .config was not generated:"
+            echo "$KERNEL_DIR/.config"
+
+            echo "Existing kernel config files:"
+            find build_dir \
+              -path '*/linux-*/.config' \
+              -print || true
+
+            exit 1
+          fi
+
+          echo "Kernel .config found:"
+          ls -lh "$KERNEL_DIR/.config"
+
+          echo "=== Kernel configuration summary ==="
+          grep -E \
+            '^(CONFIG_MODULES|CONFIG_NETFILTER|CONFIG_IP6_NF|CONFIG_NF_TABLES)' \
+            "$KERNEL_DIR/.config" || true
+
+          if ! grep -qxF 'CONFIG_MODULES=y' "$KERNEL_DIR/.config"; then
+            echo "ERROR: CONFIG_MODULES=y is not enabled"
+            exit 1
+          fi
+
+          echo "Kernel modules are enabled"
 
       - name: Build kernel modules
         shell: bash
         run: |
-          set -o pipefail
-          make -j1 package/kernel/linux/compile V=sc 2>&1 | tee kernel-build.log
+          set -euo pipefail
 
-      - name: Build ip6tables
+          make package/kernel/linux/compile -j1 V=sc 2>&1 \
+            | tee kernel-build.log
+
+      - name: Build ip6tables packages
         shell: bash
         run: |
-          set -o pipefail
-          make -j1 package/network/utils/iptables/compile V=sc 2>&1 | tee ip6tables-build.log
+          set -euo pipefail
+
+          make package/network/utils/iptables/compile -j1 V=sc 2>&1 \
+            | tee ip6tables-build.log
+
+      - name: Verify generated packages
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "=== All generated IPK packages ==="
+
+          find bin -type f \
+            \( \
+              -name '*.ipk' \
+              -o -name '*.apk' \
+            \) \
+            -print | sort
+
+          echo "=== Checking required packages ==="
+
+          find_package() {
+            local package_name="$1"
+
+            find bin -type f \
+              \( \
+                -name "${package_name}_*.ipk" \
+                -o -name "${package_name}_*.apk" \
+              \) \
+              -print -quit
+          }
+
+          KMOD_IP6TABLES="$(find_package kmod-ip6tables)"
+          KMOD_NF_IPT6="$(find_package kmod-nf-ipt6)"
+          IP6TABLES_NFT="$(find_package ip6tables-nft)"
+
+          if [ -z "$KMOD_IP6TABLES" ]; then
+            echo "ERROR: kmod-ip6tables package was not generated"
+            exit 1
+          fi
+
+          if [ -z "$KMOD_NF_IPT6" ]; then
+            echo "ERROR: kmod-nf-ipt6 package was not generated"
+            exit 1
+          fi
+
+          if [ -z "$IP6TABLES_NFT" ]; then
+            echo "ERROR: ip6tables-nft package was not generated"
+            exit 1
+          fi
+
+          echo "kmod-ip6tables:"
+          echo "$KMOD_IP6TABLES"
+
+          echo "kmod-nf-ipt6:"
+          echo "$KMOD_NF_IPT6"
+
+          echo "ip6tables-nft:"
+          echo "$IP6TABLES_NFT"
+
+      - name: Collect packages
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rm -rf result
+          mkdir -p result
+
+          find bin -type f \
+            \( \
+              -name 'kmod-ip6tables_*.ipk' \
+              -o -name 'kmod-nf-ipt6_*.ipk' \
+              -o -name 'ip6tables-nft_*.ipk' \
+              -o -name 'kmod-ip6tables_*.apk' \
+              -o -name 'kmod-nf-ipt6_*.apk' \
+              -o -name 'ip6tables-nft_*.apk' \
+            \) \
+            -exec cp -v {} result/ \;
+
+          echo "=== Collected packages ==="
+          ls -lh result
 
       - name: Upload build logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: build-logs
+          name: fanchmwrt-build-logs
           path: |
+            tools-build.log
+            toolchain-build.log
+            linux-prepare.log
+            linux-compile.log
             kernel-build.log
             ip6tables-build.log
           if-no-files-found: ignore
-
-      - name: Collect packages
-        run: |
-          mkdir -p result
-
-          find bin -type f \
-            \( \
-              -name '*kmod-ip6tables*.ipk' \
-              -o -name '*kmod-nf-ipt6*.ipk' \
-              -o -name '*ip6tables-nft*.ipk' \
-            \) \
-            -exec cp -v {} result/ \;
-
-          echo "Generated files:"
-          ls -lh result
+          retention-days: 7
 
       - name: Upload packages
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: fanchmwrt-ip6tables-kmods
           path: result/
           if-no-files-found: error
+          retention-days: 30
