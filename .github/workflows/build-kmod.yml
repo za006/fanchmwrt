@@ -68,6 +68,7 @@ jobs:
         run: |
           rm -rf staging_dir/host
           rm -rf build_dir/host
+          rm -rf build_dir/hostpkg
           rm -rf tmp
 
       - name: Build OpenWrt host tools
@@ -89,12 +90,27 @@ jobs:
           echo "libdeflate-gzip:"
           ls -l staging_dir/host/bin/libdeflate-gzip
 
-      - name: Build kernel modules and ip6tables
+      - name: Build kernel modules
+        shell: bash
         run: |
-          make -j2 \
-            package/kernel/linux/compile \
-            package/network/utils/iptables/compile \
-            V=s
+          set -o pipefail
+          make -j1 package/kernel/linux/compile V=sc 2>&1 | tee kernel-build.log
+
+      - name: Build ip6tables
+        shell: bash
+        run: |
+          set -o pipefail
+          make -j1 package/network/utils/iptables/compile V=sc 2>&1 | tee ip6tables-build.log
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: |
+            kernel-build.log
+            ip6tables-build.log
+          if-no-files-found: ignore
 
       - name: Collect packages
         run: |
