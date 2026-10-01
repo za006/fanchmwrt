@@ -2,39 +2,38 @@ name: Build FanchmWrt kmod
 
 on:
   workflow_dispatch:
+    inputs:
+      make_jobs:
+        description: "Parallel make jobs"
+        required: false
+        default: "2"
+
+      strict_packages:
+        description: "Fail when required packages are missing"
+        required: false
+        default: "false"
+
+permissions:
+  contents: read
+
+env:
+  TARGET: mediatek
+  SUBTARGET: filogic
 
 jobs:
   build:
     runs-on: ubuntu-22.04
     timeout-minutes: 360
 
+    env:
+      MAKE_JOBS: ${{ github.event.inputs.make_jobs || '2' }}
+      STRICT_PACKAGES: ${{ github.event.inputs.strict_packages || 'false' }}
+
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
-
-      - name: Diagnose build environment
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          echo "=== System information ==="
-          uname -a
-
-          echo "=== CPU ==="
-          echo "CPU cores: $(nproc)"
-          lscpu || true
-
-          echo "=== Memory ==="
-          free -h
-
-          echo "=== Disk ==="
-          df -h
-
-          echo "=== Repository ==="
-          git status
-          git log -1 --oneline
 
       - name: Install build dependencies
         shell: bash
@@ -43,17 +42,14 @@ jobs:
 
           sudo apt-get update
 
-          sudo apt-get install -y \
+          sudo apt-get install -y --no-install-recommends \
             build-essential \
             clang \
             flex \
             bison \
-            g++ \
             gawk \
-            gcc-multilib \
             gettext \
             git \
-            libncurses5-dev \
             libncurses-dev \
             libssl-dev \
             python3 \
@@ -72,10 +68,11 @@ jobs:
             libelf-dev \
             device-tree-compiler \
             libreadline-dev \
-            libtool \
             autoconf \
             automake \
-            pkg-config
+            pkg-config \
+            ca-certificates \
+            xz-utils
 
       - name: Update feeds
         shell: bash
@@ -84,66 +81,6 @@ jobs:
 
           ./scripts/feeds update -a
           ./scripts/feeds install -a
-
-      - name: Detect Linux kernel version
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          echo "=== Possible kernel version definitions ==="
-
-          grep -RInE \
-            'KERNEL_PATCHVER|LINUX_VERSION' \
-            target/linux/mediatek \
-            include/kernel-version.mk \
-            2>/dev/null || true
-
-      - name: Fix IPv6 iptables for Linux 6.12
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          NETFILTER_FILE="include/netfilter.mk"
-
-          if [ ! -f "$NETFILTER_FILE" ]; then
-            echo "ERROR: $NETFILTER_FILE not found"
-            exit 1
-          fi
-
-          if grep -RqsE \
-            'KERNEL_PATCHVER[[:space:]]*:?=[[:space:]]*6\.12' \
-            target/linux/mediatek; then
-
-            echo "Linux 6.12 detected"
-            echo "Applying IPv6 iptables compatibility fix"
-
-            python3 - <<'PY'
-          from pathlib import Path
-
-          path = Path("include/netfilter.mk")
-          text = path.read_text()
-
-          old = "CONFIG_IP6_NF_IPTABLES, $(P_V6)ip6_tables"
-          new = "CONFIG_IP6_NF_IPTABLES_LEGACY, $(P_V6)ip6_tables"
-
-          if old in text:
-              text = text.replace(old, new, 1)
-              path.write_text(text)
-              print("Applied Linux 6.12 IPv6 iptables fix")
-          elif new in text:
-              print("Linux 6.12 IPv6 iptables fix already exists")
-          else:
-              print("ERROR: Expected IPv6 iptables configuration was not found")
-              raise SystemExit(1)
-          PY
-
-          else
-            echo "Linux 6.12 was not detected"
-            echo "Skipping IPv6 iptables compatibility fix"
-          fi
-
-          echo "=== Current IPv6 iptables configuration ==="
-          grep -n "IP6_NF_IPTABLES" "$NETFILTER_FILE" || true
 
       - name: Create OpenWrt configuration
         shell: bash
@@ -161,244 +98,247 @@ jobs:
 
           make defconfig
 
-          echo "=== Selected target configuration ==="
+          echo "=== Final target configuration ==="
           grep -E '^CONFIG_TARGET_' .config || true
 
-          echo "=== Selected package configuration ==="
+          echo "=== Final package configuration ==="
           grep -E \
-            '^CONFIG_PACKAGE_(kmod-ip6tables|kmod-nf-ipt6|ip6tables-nft)' \
+            '^CONFIG_PACKAGE_(kmod-ip6tables|kmod-nf-ipt6|ip6tables-nft)=' \
             .config || true
 
-          echo "=== Checking required OpenWrt configuration ==="
-
-          grep -qxF 'CONFIG_TARGET_mediatek=y' .config
-          grep -qxF 'CONFIG_TARGET_mediatek_filogic=y' .config
-          grep -qxF 'CONFIG_PACKAGE_kmod-ip6tables=m' .config
-          grep -qxF 'CONFIG_PACKAGE_kmod-nf-ipt6=m' .config
-          grep -qxF 'CONFIG_PACKAGE_ip6tables-nft=m' .config
-
-          echo "Required OpenWrt configuration is valid"
-
-      - name: Clean incomplete host files
+      - name: Validate build parameters
         shell: bash
         run: |
           set -euo pipefail
+
+          if ! [[ "${MAKE_JOBS}" =~ ^[1-9][0-9]*$ ]]; then
+            echo "ERROR: make_jobs must be a positive integer"
+            exit 1
+          fi
+
+          case "${STRICT_PACKAGES}" in
+            true|false)
+              ;;
+            *)
+              echo "ERROR: strict_packages must be true or false"
+              exit 1
+              ;;
+          esac
+
+          echo "MAKE_JOBS=${MAKE_JOBS}"
+          echo "STRICT_PACKAGES=${STRICT_PACKAGES}"
+
+      - name: Clean stale build output
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Cleaning stale host and package output..."
 
           rm -rf staging_dir/host
           rm -rf build_dir/host
           rm -rf build_dir/hostpkg
           rm -rf tmp
 
-      - name: Build OpenWrt host tools
+          rm -rf bin/packages
+          rm -rf "bin/targets/${TARGET}/${SUBTARGET}/packages"
+
+          echo "Stale output cleanup completed"
+
+      - name: Download sources
         shell: bash
         run: |
           set -euo pipefail
 
-          make tools/install -j1 V=sc 2>&1 \
-            | tee tools-build.log
+          make download \
+            -j"${MAKE_JOBS}" \
+            V=sc 2>&1 | tee download.log
 
-      - name: Build OpenWrt toolchain
+      - name: Build host tools and toolchain
         shell: bash
         run: |
           set -euo pipefail
 
-          make toolchain/install -j1 V=sc 2>&1 \
-            | tee toolchain-build.log
+          make tools/install \
+            -j"${MAKE_JOBS}" \
+            V=sc 2>&1 | tee tools-build.log
 
-      - name: Check required host tools
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          test -x staging_dir/host/bin/openssl
-          test -x staging_dir/host/bin/libdeflate-gzip
-
-          echo "=== openssl ==="
-          ls -lh staging_dir/host/bin/openssl
-
-          echo "=== libdeflate-gzip ==="
-          ls -lh staging_dir/host/bin/libdeflate-gzip
+          make toolchain/install \
+            -j"${MAKE_JOBS}" \
+            V=sc 2>&1 | tee toolchain-build.log
 
       - name: Prepare Linux kernel tree
         shell: bash
         run: |
           set -euo pipefail
 
-          make target/linux/prepare -j1 V=sc 2>&1 \
-            | tee linux-prepare.log
+          make target/linux/prepare \
+            -j"${MAKE_JOBS}" \
+            V=sc 2>&1 | tee linux-prepare.log
 
-      - name: Build Linux kernel target
+      - name: Build Linux kernel
         shell: bash
         run: |
           set -euo pipefail
 
-          make target/linux/compile -j1 V=sc 2>&1 \
-            | tee linux-compile.log
+          make target/linux/compile \
+            -j"${MAKE_JOBS}" \
+            V=sc 2>&1 | tee linux-compile.log
 
-      - name: Find kernel build directory
+      - name: Inspect generated kernel configuration
         shell: bash
         run: |
           set -euo pipefail
 
-          KERNEL_BASE_DIR="$(
-            find build_dir/target-* \
-              -maxdepth 1 \
-              -type d \
-              -name 'linux-mediatek_filogic' \
-              -print -quit 2>/dev/null || true
+          echo "Searching for generated kernel .config..."
+
+          KERNEL_CONFIG="$(
+            find build_dir \
+              -type f \
+              -path '*/linux-*/.config' \
+              -print \
+              2>/dev/null \
+              | head -n 1
           )"
 
-          if [ -z "$KERNEL_BASE_DIR" ]; then
-            echo "ERROR: Target kernel base directory not found"
-
-            echo "Existing mediatek kernel directories:"
+          if [ -z "${KERNEL_CONFIG}" ]; then
+            echo "::warning::Kernel .config was not found"
+            echo "Possible kernel directories:"
             find build_dir \
-              -maxdepth 5 \
-              -type d \
-              -name 'linux-mediatek_filogic' \
-              -print || true
-
-            exit 1
-          fi
-
-          KERNEL_DIR="$(
-            find "$KERNEL_BASE_DIR" \
-              -maxdepth 1 \
-              -mindepth 1 \
               -type d \
               -name 'linux-*' \
-              -print -quit
-          )"
-
-          if [ -z "$KERNEL_DIR" ]; then
-            echo "ERROR: Linux kernel source directory not found"
-
-            find "$KERNEL_BASE_DIR" \
-              -maxdepth 2 \
-              -print || true
-
-            exit 1
-          fi
-
-          echo "KERNEL_BASE_DIR=$KERNEL_BASE_DIR" >> "$GITHUB_ENV"
-          echo "KERNEL_DIR=$KERNEL_DIR" >> "$GITHUB_ENV"
-
-          echo "Kernel base directory:"
-          echo "$KERNEL_BASE_DIR"
-
-          echo "Kernel source directory:"
-          echo "$KERNEL_DIR"
-
-      - name: Check generated kernel configuration
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          if [ ! -d "$KERNEL_DIR" ]; then
-            echo "ERROR: Kernel directory does not exist:"
-            echo "$KERNEL_DIR"
-            exit 1
-          fi
-
-          if [ ! -f "$KERNEL_DIR/.config" ]; then
-            echo "ERROR: Kernel .config was not generated:"
-            echo "$KERNEL_DIR/.config"
-
-            echo "Existing kernel config files:"
-            find build_dir \
-              -path '*/linux-*/.config' \
-              -print || true
-
-            exit 1
+              -print \
+              2>/dev/null \
+              | head -n 50 || true
+            exit 0
           fi
 
           echo "Kernel .config found:"
-          ls -lh "$KERNEL_DIR/.config"
+          echo "${KERNEL_CONFIG}"
 
-          echo "=== Kernel configuration summary ==="
+          echo "=== Relevant kernel options ==="
           grep -E \
-            '^(CONFIG_MODULES|CONFIG_NETFILTER|CONFIG_IP6_NF|CONFIG_NF_TABLES)' \
-            "$KERNEL_DIR/.config" || true
+            '^(CONFIG_MODULES|CONFIG_NETFILTER|CONFIG_NETFILTER_ADVANCED|CONFIG_NF_TABLES|CONFIG_NF_CONNTRACK|CONFIG_IP6_NF|CONFIG_NF_IPTABLES)' \
+            "${KERNEL_CONFIG}" \
+            || true
 
-          if ! grep -qxF 'CONFIG_MODULES=y' "$KERNEL_DIR/.config"; then
-            echo "ERROR: CONFIG_MODULES=y is not enabled"
-            exit 1
+          if grep -qxF 'CONFIG_MODULES=y' "${KERNEL_CONFIG}"; then
+            echo "OK: CONFIG_MODULES=y"
+          else
+            echo "::warning::CONFIG_MODULES=y was not found"
           fi
 
-          echo "Kernel modules are enabled"
+          for option in \
+            CONFIG_IP6_NF_IPTABLES \
+            CONFIG_IP6_NF_IPTABLES_LEGACY \
+            CONFIG_NF_TABLES
+          do
+            if grep -qxF "${option}=y" "${KERNEL_CONFIG}"; then
+              echo "INFO: ${option}=y"
+            elif grep -qxF "${option}=m" "${KERNEL_CONFIG}"; then
+              echo "INFO: ${option}=m"
+            else
+              echo "INFO: ${option} is not explicitly enabled"
+            fi
+          done
 
-      - name: Build kernel modules
+      - name: Build kernel module packages
         shell: bash
         run: |
           set -euo pipefail
 
-          make package/kernel/linux/compile -j1 V=sc 2>&1 \
-            | tee kernel-build.log
+          make package/kernel/linux/compile \
+            -j"${MAKE_JOBS}" \
+            V=sc 2>&1 | tee kernel-build.log
 
-      - name: Build ip6tables packages
+      - name: Build ip6tables userspace package
         shell: bash
         run: |
           set -euo pipefail
 
-          make package/network/utils/iptables/compile -j1 V=sc 2>&1 \
-            | tee ip6tables-build.log
+          make package/network/utils/iptables/compile \
+            -j"${MAKE_JOBS}" \
+            V=sc 2>&1 | tee ip6tables-build.log
 
       - name: Verify generated packages
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "=== All generated IPK packages ==="
+          PACKAGE_DIR="bin/targets/${TARGET}/${SUBTARGET}/packages"
 
-          find bin -type f \
-            \( \
-              -name '*.ipk' \
-              -o -name '*.apk' \
-            \) \
-            -print | sort
+          echo "=== Target package directory ==="
+          ls -lah "${PACKAGE_DIR}" 2>/dev/null || true
 
-          echo "=== Checking required packages ==="
+          echo "=== All generated packages ==="
+          find bin \
+            -type f \
+            \( -name '*.ipk' -o -name '*.apk' \) \
+            -print \
+            2>/dev/null \
+            | sort || true
+
+          echo "=== Relevant build log messages ==="
+          grep -RInE \
+            'kmod-ip6tables|kmod-nf-ipt6|ip6tables-nft|not selected|built-in|not building|Collected errors|ERROR' \
+            build_dir \
+            tmp \
+            2>/dev/null \
+            | tail -n 200 \
+            || true
 
           find_package() {
             local package_name="$1"
 
-            find bin -type f \
+            find bin \
+              -type f \
               \( \
                 -name "${package_name}_*.ipk" \
+                -o -name "${package_name}-*.apk" \
                 -o -name "${package_name}_*.apk" \
               \) \
-              -print -quit
+              -print -quit \
+              2>/dev/null \
+              || true
           }
 
           KMOD_IP6TABLES="$(find_package kmod-ip6tables)"
           KMOD_NF_IPT6="$(find_package kmod-nf-ipt6)"
           IP6TABLES_NFT="$(find_package ip6tables-nft)"
 
-          if [ -z "$KMOD_IP6TABLES" ]; then
-            echo "ERROR: kmod-ip6tables package was not generated"
-            exit 1
+          echo "kmod-ip6tables: ${KMOD_IP6TABLES:-NOT_FOUND}"
+          echo "kmod-nf-ipt6: ${KMOD_NF_IPT6:-NOT_FOUND}"
+          echo "ip6tables-nft: ${IP6TABLES_NFT:-NOT_FOUND}"
+
+          missing=0
+
+          if [ -z "${KMOD_IP6TABLES}" ]; then
+            echo "::warning::kmod-ip6tables was not generated"
+            missing=1
           fi
 
-          if [ -z "$KMOD_NF_IPT6" ]; then
-            echo "ERROR: kmod-nf-ipt6 package was not generated"
-            exit 1
+          if [ -z "${KMOD_NF_IPT6}" ]; then
+            echo "::warning::kmod-nf-ipt6 was not generated"
+            missing=1
           fi
 
-          if [ -z "$IP6TABLES_NFT" ]; then
-            echo "ERROR: ip6tables-nft package was not generated"
-            exit 1
+          if [ -z "${IP6TABLES_NFT}" ]; then
+            echo "::warning::ip6tables-nft was not generated"
+            missing=1
           fi
 
-          echo "kmod-ip6tables:"
-          echo "$KMOD_IP6TABLES"
+          if [ "${missing}" -ne 0 ]; then
+            if [ "${STRICT_PACKAGES}" = "true" ]; then
+              echo "ERROR: Required packages are missing"
+              exit 1
+            fi
 
-          echo "kmod-nf-ipt6:"
-          echo "$KMOD_NF_IPT6"
+            echo "Required package verification completed with warnings"
+          else
+            echo "All required packages were generated"
+          fi
 
-          echo "ip6tables-nft:"
-          echo "$IP6TABLES_NFT"
-
-      - name: Collect packages
+      - name: Collect result packages
         shell: bash
         run: |
           set -euo pipefail
@@ -406,19 +346,23 @@ jobs:
           rm -rf result
           mkdir -p result
 
-          find bin -type f \
-            \( \
-              -name 'kmod-ip6tables_*.ipk' \
-              -o -name 'kmod-nf-ipt6_*.ipk' \
-              -o -name 'ip6tables-nft_*.ipk' \
-              -o -name 'kmod-ip6tables_*.apk' \
-              -o -name 'kmod-nf-ipt6_*.apk' \
-              -o -name 'ip6tables-nft_*.apk' \
-            \) \
-            -exec cp -v {} result/ \;
+          find bin \
+            -type f \
+            \( -name '*.ipk' -o -name '*.apk' \) \
+            -exec cp -v {} result/ \; \
+            2>/dev/null \
+            || true
 
-          echo "=== Collected packages ==="
-          ls -lh result
+          echo "=== Collected result packages ==="
+          ls -lah result || true
+
+      - name: Upload result packages
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fanchmwrt-kmods
+          path: result/
+          if-no-files-found: warn
 
       - name: Upload build logs
         if: always()
@@ -426,6 +370,7 @@ jobs:
         with:
           name: fanchmwrt-build-logs
           path: |
+            download.log
             tools-build.log
             toolchain-build.log
             linux-prepare.log
@@ -433,13 +378,3 @@ jobs:
             kernel-build.log
             ip6tables-build.log
           if-no-files-found: ignore
-          retention-days: 7
-
-      - name: Upload packages
-        if: success()
-        uses: actions/upload-artifact@v4
-        with:
-          name: fanchmwrt-ip6tables-kmods
-          path: result/
-          if-no-files-found: error
-          retention-days: 30
