@@ -51,6 +51,31 @@ jobs:
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
+      - name: Fix IPv6 iptables module for Linux 6.12
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("include/netfilter.mk")
+          text = path.read_text()
+
+          old = "CONFIG_IP6_NF_IPTABLES, $(P_V6)ip6_tables"
+          new = "CONFIG_IP6_NF_IPTABLES_LEGACY, $(P_V6)ip6_tables"
+
+          if old in text:
+              text = text.replace(old, new, 1)
+              path.write_text(text)
+              print("Applied Linux 6.12 IPv6 iptables fix")
+          elif new in text:
+              print("Linux 6.12 IPv6 iptables fix already exists")
+          else:
+              print("Cannot find expected IPv6 iptables line")
+              raise SystemExit(1)
+          PY
+
+          echo "Current IPv6 iptables configuration:"
+          grep -n "IP6_NF_IPTABLES" include/netfilter.mk
+
       - name: Create configuration
         run: |
           cat > .config <<'EOF'
